@@ -149,6 +149,7 @@ filegroup {
         "nci/**/*.java",
         ":framework-nfc-javastream-protos",
         ":statslog-Nfc-java-gen",
+        "aidl/**/*.aidl",  // 2by2 Additions for felica
     ],
     visibility: [
         "//packages/modules/Nfc/NfcNci/tests/unit",

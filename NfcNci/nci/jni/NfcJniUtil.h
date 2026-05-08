@@ -154,4 +154,7 @@ struct nfc_jni_native_data* nfc_jni_get_nat(JNIEnv* e, jobject o);
 int register_com_android_nfc_NativeNfcManager(JNIEnv* e);
 int register_com_android_nfc_NativeNfcTag(JNIEnv* e);
 int register_com_android_nfc_NativeT4tNfcee(JNIEnv* e);
+
+// 2by2 Additions for felica
+int register_com_android_nfc_NativeFelicaSe(JNIEnv* e);
 }  // namespace android
