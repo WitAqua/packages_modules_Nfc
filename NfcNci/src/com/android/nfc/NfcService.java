@@ -6708,5 +6708,50 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
 
         return result;
     }
+
+    // 2by2 Additions for felica
+    public static boolean requestFelicaRoutingAndWait(long timeoutMs) {
+        NfcService service = getInstance();
+        if (service == null) {
+            return false;
+        }
+        return service.requestFelicaRoutingAndWaitInternal(timeoutMs);
+    }
+
+    public static boolean isFelicaNfcEnabled() {
+        NfcService service = getInstance();
+        return service != null && service.isNfcEnabled();
+    }
+
+    private boolean requestFelicaRoutingAndWaitInternal(long timeoutMs) {
+        if (Looper.myLooper() == mHandler.getLooper()) {
+            if (!isNfcEnabledOrShuttingDown()) {
+                return false;
+            }
+            applyRouting(true);
+            return true;
+        }
+
+        CountDownLatch latch = new CountDownLatch(1);
+        boolean[] success = new boolean[] {false};
+        mHandler.post(() -> {
+            try {
+                if (!isNfcEnabledOrShuttingDown()) {
+                    return;
+                }
+                applyRouting(true);
+                success[0] = true;
+            } finally {
+                latch.countDown();
+            }
+        });
+
+        try {
+            return latch.await(timeoutMs, TimeUnit.MILLISECONDS) && success[0];
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
 }
 

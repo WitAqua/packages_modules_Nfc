@@ -154,5 +154,13 @@
 
         <service android:name=".handover.PeripheralHandoverService"
         />
+
+        <!-- 2by2 Additions for felica -->
+        <provider
+            android:name="jp.project2by2.felica.FelicaInitProvider"
+            android:authorities="jp.project2by2.felica.init"
+            android:exported="false"
+            android:directBootAware="true"
+            android:initOrder="100" />
     </application>
 </manifest>

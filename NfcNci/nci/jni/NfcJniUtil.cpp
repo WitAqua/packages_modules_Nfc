@@ -56,6 +56,10 @@ jint JNI_OnLoad(JavaVM* jvm, void*) {
     return JNI_ERR;
   if (NativeWlcManager::getInstance().registerJniFunctions(e) == -1)
     return JNI_ERR;
+
+  // 2by2 Additions for felica
+  if (android::register_com_android_nfc_NativeFelicaSe(e) == -1) return JNI_ERR;
+
   LOG(DEBUG) << StringPrintf("%s: exit", __func__);
   return JNI_VERSION_1_6;
 }
