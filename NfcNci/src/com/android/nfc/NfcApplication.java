@@ -25,6 +25,9 @@ import android.os.Looper;
 import android.os.Process;
 import android.os.UserHandle;
 
+// 2by2 Additions for felica
+import jp.project2by2.felica.FelicaBackendService;
+
 import java.util.Iterator;
 import java.util.List;
 
@@ -63,6 +66,9 @@ public class NfcApplication extends Application {
         }
         if (UserHandle.myUserId() == 0 && isMainProcess) {
             mNfcService = new NfcService(this, new NfcInjector(this, Looper.myLooper()));
+
+            // 2by2 Additions for felica
+            FelicaBackendService.register();
         }
     }
 }
