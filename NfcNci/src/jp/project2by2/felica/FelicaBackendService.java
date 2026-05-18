@@ -37,6 +37,8 @@ public final class FelicaBackendService extends IFelica.Stub {
 
     private final NativeFelicaSe mNativeSe = new NativeFelicaSe();
     private final Map<Integer, Session> mSeSessions = new HashMap<>();
+    private final Map<Integer, Session> mRfSessions = new HashMap<>();
+    private int mNextRfHandle = 1;
 
     private FelicaBackendService() {
     }
@@ -95,7 +97,7 @@ public final class FelicaBackendService extends IFelica.Stub {
             return openError(handle);
         }
 
-        Session session = new Session(handle, token);
+        Session session = new Session(handle, token, true);
         try {
             token.linkToDeath(session, 0);
         } catch (RemoteException e) {
@@ -180,12 +182,53 @@ public final class FelicaBackendService extends IFelica.Stub {
 
     @Override
     public Bundle openRf(String packageName, IBinder token) {
-        return openError(ERROR_NOT_AVAILABLE);
+        Log.i(TAG, "openRf package=" + packageName);
+
+        if (token == null) {
+            return openError(ERROR_INVALID_PARAM);
+        }
+
+        synchronized (this) {
+            if (!mRfSessions.isEmpty()) {
+                for (Session session : mRfSessions.values()) {
+                    if (session.token == token) {
+                        return openSuccess(session.handle);
+                    }
+                }
+                return openError(ERROR_BUSY);
+            }
+
+            int handle = mNextRfHandle++;
+            if (mNextRfHandle <= 0) {
+                mNextRfHandle = 1;
+            }
+
+            Session session = new Session(handle, token, false);
+            try {
+                token.linkToDeath(session, 0);
+            } catch (RemoteException e) {
+                return openError(ERROR_FAILED);
+            }
+
+            mRfSessions.put(handle, session);
+            return openSuccess(handle);
+        }
     }
 
     @Override
     public int closeRf(String packageName, int handle, IBinder token) {
-        return ERROR_NOT_AVAILABLE;
+        Session session;
+
+        synchronized (this) {
+            session = mRfSessions.get(handle);
+            if (session == null || (token != null && session.token != token)) {
+                return ERROR_INVALID_PARAM;
+            }
+            mRfSessions.remove(handle);
+        }
+
+        session.token.unlinkToDeath(session, 0);
+        return ERROR_NONE;
     }
 
     @Override
@@ -195,17 +238,23 @@ public final class FelicaBackendService extends IFelica.Stub {
 
     @Override
     public int cancelRf(String packageName, int handle) {
-        return ERROR_NOT_AVAILABLE;
+        synchronized (this) {
+            return mRfSessions.containsKey(handle) ? ERROR_NONE : ERROR_INVALID_PARAM;
+        }
     }
 
     @Override
     public int connectRf(String packageName, int handle, int timeoutMs) {
-        return ERROR_NOT_AVAILABLE;
+        synchronized (this) {
+            return mRfSessions.containsKey(handle) ? ERROR_NONE : ERROR_INVALID_PARAM;
+        }
     }
 
     @Override
     public int disconnectRf(String packageName, int handle) {
-        return ERROR_NOT_AVAILABLE;
+        synchronized (this) {
+            return mRfSessions.containsKey(handle) ? ERROR_NONE : ERROR_INVALID_PARAM;
+        }
     }
 
     @Override
@@ -294,16 +343,23 @@ public final class FelicaBackendService extends IFelica.Stub {
     private final class Session implements IBinder.DeathRecipient {
         final int handle;
         final IBinder token;
+        final boolean se;
 
-        Session(int handle, IBinder token) {
+        Session(int handle, IBinder token, boolean se) {
             this.handle = handle;
             this.token = token;
+            this.se = se;
         }
 
         @Override
         public void binderDied() {
             synchronized (FelicaBackendService.this) {
-                mSeSessions.remove(handle);
+                if (se) {
+                    mSeSessions.remove(handle);
+                } else {
+                    mRfSessions.remove(handle);
+                    return;
+                }
             }
 
             try {
