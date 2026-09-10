@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-package jp.project2by2.felica;
+package org.witaqua.felica;
 
 import android.nfc.NfcAdapter;
 import android.os.Bundle;
@@ -19,7 +19,7 @@ import java.util.Map;
 
 public final class FelicaBackendService extends IFelica.Stub {
     private static final String TAG = "FelicaBackendService";
-    private static final String SERVICE_NAME = "jp.project2by2.felica.IFelica/default";
+    private static final String SERVICE_NAME = "org.witaqua.felica.IFelica/default";
 
     private static final int ERROR_NONE = 0;
     private static final int ERROR_FAILED = -99;

@@ -24,7 +24,7 @@ extern bool nfcManager_isNfcActive();
 
 namespace {
 constexpr const char* kNativeFelicaSeClassName =
-    "jp/project2by2/felica/NativeFelicaSe";
+    "org/witaqua/felica/NativeFelicaSe";
 constexpr int kFelicaSeTimeoutMs = 1000;
 constexpr int kErrorNone = 0;
 constexpr int kErrorFailed = -99;
