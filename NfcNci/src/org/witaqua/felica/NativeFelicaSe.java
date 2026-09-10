@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-package jp.project2by2.felica;
+package org.witaqua.felica;
 
 /** Reverse engineered native felica SE endpoint */
 public final class NativeFelicaSe {

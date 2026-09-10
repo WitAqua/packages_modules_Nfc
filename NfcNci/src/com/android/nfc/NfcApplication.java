@@ -26,7 +26,7 @@ import android.os.Process;
 import android.os.UserHandle;
 
 // 2by2 Additions for felica
-import jp.project2by2.felica.FelicaBackendService;
+import org.witaqua.felica.FelicaBackendService;
 
 import java.util.Iterator;
 import java.util.List;
