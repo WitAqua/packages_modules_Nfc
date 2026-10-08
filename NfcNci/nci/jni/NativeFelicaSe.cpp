@@ -30,6 +30,8 @@ constexpr int kErrorNone = 0;
 constexpr int kErrorFailed = -99;
 constexpr int kErrorInvalidParam = -10;
 constexpr int kErrorBusy = -11;
+constexpr int kErrorTimeout = -13;
+constexpr int kErrorCanceled = -17;
 constexpr int kErrorNotAvailable = -18;
 constexpr uint8_t kFelicaSeInterface = 0x02;  // NCI_NFCEE_INTERFACE_T3T
 
@@ -45,6 +47,9 @@ tNFA_STATUS sFelicaSeModeSetStatus = NFA_STATUS_FAILED;
 tNFA_HANDLE sFelicaSeHandle = NFA_HANDLE_INVALID;
 bool sFelicaSeEeRegistered = false;
 bool sFelicaSeConnected = false;
+// Set by doCancel() so that a transceive woken up by it can tell a cancel
+// from a response.  Mobile FeliCa tells the two apart by error code.
+bool sFelicaSeCanceled = false;
 
 tNFA_HANDLE normalizeEeHandle(tNFA_HANDLE handle) {
   if (handle != 0 && (handle & NFA_HANDLE_GROUP_MASK) == 0) {
@@ -332,24 +337,40 @@ jbyteArray nativeFelicaSe_doTransceive(JNIEnv* env, jobject, jint handle,
     return nullptr;
   }
 
+  // The client (ChipController.convertNfcErrorToOfflineException) only
+  // understands the -20..-10 range: a timeout has to come back as -13 and a
+  // cancel as -17, or both collapse into "unknown error".  The stock
+  // libLGnfc_jni does the same: -13 when the wait runs out, -17 when
+  // doCancel woke it, -11 when NFA_EeSendData refuses (no connection).
   tNFA_STATUS status;
+  int failure = kErrorFailed;
   {
     SyncEventGuard guard(sFelicaSeDataEvent);
     sFelicaSeRxData.clear();
+    sFelicaSeCanceled = false;
     status = NFA_EeSendData(sFelicaSeHandle, commandBytes.size(),
                             reinterpret_cast<uint8_t*>(const_cast<jbyte*>(commandBytes.get())));
     if (status == NFA_STATUS_OK) {
       int waitMs = timeoutMs > 0 ? timeoutMs : kFelicaSeTimeoutMs;
       if (!sFelicaSeDataEvent.wait(waitMs)) {
         status = NFA_STATUS_FAILED;
+        failure = kErrorTimeout;
+      } else if (sFelicaSeCanceled) {
+        status = NFA_STATUS_FAILED;
+        failure = kErrorCanceled;
       } else {
         status = sFelicaSeStatus;
       }
+    } else if (status == NFA_STATUS_INVALID_PARAM) {
+      failure = kErrorBusy;
     }
+    sFelicaSeCanceled = false;
   }
 
   if (status != NFA_STATUS_OK) {
-    LOG(ERROR) << StringPrintf("%s: NFA_EeSendData failed status=0x%02X", __func__, status);
+    LOG(ERROR) << StringPrintf("%s: NFA_EeSendData failed status=0x%02X error=%d",
+                               __func__, status, failure);
+    errorData[0] = failure;
     env->ReleaseIntArrayElements(error, errorData, 0);
     return nullptr;
   }
@@ -371,6 +392,7 @@ jbyteArray nativeFelicaSe_doTransceive(JNIEnv* env, jobject, jint handle,
 void nativeFelicaSe_doCancel(JNIEnv*, jobject, jint) {
   SyncEventGuard guard(sFelicaSeDataEvent);
   sFelicaSeStatus = NFA_STATUS_FAILED;
+  sFelicaSeCanceled = true;
   sFelicaSeDataEvent.notifyOne();
 }
 
