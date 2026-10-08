@@ -4858,6 +4858,11 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
     }
 
     private NfcDiscoveryParameters computeDiscoveryParameters(int screenState) {
+        // 2by2 Additions for felica
+        if (mFelicaSessionActive) {
+            return computeFelicaDiscoveryParameters();
+        }
+
         // Recompute discovery parameters based on screen state
         NfcDiscoveryParameters.Builder paramsBuilder = NfcDiscoveryParameters.newBuilder();
         // Polling
@@ -6716,6 +6721,83 @@ public class NfcService implements DeviceHostListener, ForegroundUtils.Callback 
             return false;
         }
         return service.requestFelicaRoutingAndWaitInternal(timeoutMs);
+    }
+
+    // Set while Mobile FeliCa holds a session on the felica element.  The
+    // stock LG NfcService stops polling and keeps only listening for that
+    // long (VNfcService.applyRoutingForFn -> mUseFeliCa -> ONLY_F_LISTEN),
+    // whatever the screen does.  Here the parameters below do the same: they
+    // do not depend on the screen state, so applyRouting() finds them equal
+    // on every screen transition and leaves RF discovery alone underneath a
+    // wired transaction.  Online issuance keeps the element busy for tens of
+    // seconds, long enough to run into those transitions.
+    private volatile boolean mFelicaSessionActive;
+
+    private NfcDiscoveryParameters computeFelicaDiscoveryParameters() {
+        NfcDiscoveryParameters.Builder paramsBuilder = NfcDiscoveryParameters.newBuilder();
+        // No polling and no reader mode: reader mode turns listening off, and
+        // the element still has to answer an external reader.  Listening
+        // itself stays on through host routing.
+        paramsBuilder.setTechMask(0);
+        if (mIsHceCapable) {
+            paramsBuilder.setEnableHostRouting(true);
+        }
+        return paramsBuilder.build();
+    }
+
+    // Returns 0, or the felica error code to hand back to the client:
+    // -12 (conflict) while a tag is connected, as the stock service does, and
+    // -99 when NFC is off or the handler did not get to it in time.
+    public static int setFelicaSessionActiveAndWait(boolean active, long timeoutMs) {
+        NfcService service = getInstance();
+        if (service == null) {
+            return -99;
+        }
+        return service.setFelicaSessionActiveAndWaitInternal(active, timeoutMs);
+    }
+
+    private int setFelicaSessionActiveAndWaitInternal(boolean active, long timeoutMs) {
+        int[] result = new int[] {-99};
+        Runnable apply = () -> {
+            synchronized (NfcService.this) {
+                if (active && !isNfcEnabledOrShuttingDown()) {
+                    return;
+                }
+                if (active && isTagPresent()) {
+                    result[0] = -12;
+                    return;
+                }
+                mFelicaSessionActive = active;
+            }
+            // applyRouting() itself bails out when NFC is off; the flag is
+            // then picked up the next time NFC comes on.
+            applyRouting(true);
+            result[0] = 0;
+        };
+
+        if (Looper.myLooper() == mHandler.getLooper()) {
+            apply.run();
+            return result[0];
+        }
+
+        CountDownLatch latch = new CountDownLatch(1);
+        mHandler.post(() -> {
+            try {
+                apply.run();
+            } finally {
+                latch.countDown();
+            }
+        });
+
+        try {
+            if (!latch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
+                return -99;
+            }
+            return result[0];
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return -99;
+        }
     }
 
     public static boolean isFelicaNfcEnabled() {

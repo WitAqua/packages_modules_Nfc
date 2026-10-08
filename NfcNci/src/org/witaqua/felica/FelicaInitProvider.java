@@ -29,7 +29,7 @@ public final class FelicaInitProvider extends ContentProvider {
         }
 
         Log.i(TAG, "registering IFelica/default");
-        FelicaBackendService.register();
+        FelicaBackendService.register(getContext());
         return true;
     }
 

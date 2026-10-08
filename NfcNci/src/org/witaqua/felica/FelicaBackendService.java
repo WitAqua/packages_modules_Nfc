@@ -5,9 +5,11 @@
 
 package org.witaqua.felica;
 
+import android.content.Context;
 import android.nfc.NfcAdapter;
 import android.os.Bundle;
 import android.os.IBinder;
+import android.os.PowerManager;
 import android.os.RemoteException;
 import android.os.ServiceManager;
 import android.util.Log;
@@ -17,18 +19,40 @@ import com.android.nfc.NfcService;
 import java.util.HashMap;
 import java.util.Map;
 
+// Session model, as in the stock LG NfcService (com.android.nfc.FelicaService):
+//
+//   open        claims the element for the caller and pins RF discovery to
+//               listen-only (NfcService.setFelicaSessionActiveAndWait).
+//               No NCI traffic towards the element yet.
+//   connect     opens the wired (NFCEE) connection.
+//   transceive  only while connected.
+//   disconnect  closes the wired connection.  The element answers external
+//               readers again.
+//   close       releases the claim and unpins discovery.
+//
+// Mobile FeliCa Client relies on connect/disconnect being real: its reset
+// path (FelicaSeController.reset with disconnect), the TCAP device used for
+// online issuance (TcapFelicaDevice.execute/executeThru/close) and every
+// select() go through disconnect -> connect, and a client-side "connected"
+// flag that the backend does not share ends up with transceive failing on a
+// connection that is gone.
 public final class FelicaBackendService extends IFelica.Stub {
     private static final String TAG = "FelicaBackendService";
     private static final String SERVICE_NAME = "org.witaqua.felica.IFelica/default";
 
+    // Same vocabulary as com.felicanetworks.felica (ChipController.TYPE_NFC_*).
     private static final int ERROR_NONE = 0;
     private static final int ERROR_FAILED = -99;
     private static final int ERROR_INVALID_PARAM = -10;
     private static final int ERROR_BUSY = -11;
+    private static final int ERROR_INVALID_STATUS = -11;
+    private static final int ERROR_TIMEOUT = -13;
     private static final int ERROR_NOT_AVAILABLE = -18;
 
     private static final int STATE_OFF = 1;
     private static final int STATE_ON = 3;
+
+    private static final int NO_DEVICE_HANDLE = -1;
 
     private static final long ROUTING_TIMEOUT_MS = 1500;
     private static final int WARMUP_TRANSCEIVE_TIMEOUT_MS = 1000;
@@ -38,19 +62,33 @@ public final class FelicaBackendService extends IFelica.Stub {
     private final NativeFelicaSe mNativeSe = new NativeFelicaSe();
     private final Map<Integer, Session> mSeSessions = new HashMap<>();
     private final Map<Integer, Session> mRfSessions = new HashMap<>();
+    private int mNextSeHandle = 1;
     private int mNextRfHandle = 1;
 
-    private FelicaBackendService() {
+    // Serializes opening and closing the wired connection.  Not held across a
+    // session's transceive, so that cancel can still reach the native side.
+    private final Object mNativeLock = new Object();
+
+    // The stock service holds a partial wake lock across every connect,
+    // transceive and disconnect (mFelicaServiceWakeLock).  An online issuance
+    // runs long enough for the screen to go off in the middle of it.
+    private final PowerManager.WakeLock mWakeLock;
+
+    private FelicaBackendService(Context context) {
+        PowerManager pm = context != null ? context.getSystemService(PowerManager.class) : null;
+        mWakeLock = pm != null
+                ? pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "FelicaBackendService")
+                : null;
     }
 
-    public static void register() {
+    public static void register(Context context) {
         try {
             if (checkService(SERVICE_NAME) != null) {
                 Log.i(TAG, SERVICE_NAME + " already registered");
                 return;
             }
 
-            addService(SERVICE_NAME, new FelicaBackendService());
+            addService(SERVICE_NAME, new FelicaBackendService(context));
             Log.i(TAG, "registered " + SERVICE_NAME);
         } catch (ReflectiveOperationException | RuntimeException e) {
             Log.e(TAG, "failed to register " + SERVICE_NAME, e);
@@ -65,6 +103,41 @@ public final class FelicaBackendService extends IFelica.Stub {
     private static void addService(String name, IBinder service) throws ReflectiveOperationException {
         ServiceManager.class.getMethod("addService", String.class, IBinder.class)
                 .invoke(null, name, service);
+    }
+
+    private void acquireWakeLock() {
+        if (mWakeLock != null) {
+            mWakeLock.acquire();
+        }
+    }
+
+    private void releaseWakeLock() {
+        if (mWakeLock != null && mWakeLock.isHeld()) {
+            mWakeLock.release();
+        }
+    }
+
+    // Pins discovery while any SE or RF session is open, unpins after the last
+    // one is gone.  Returns the error to hand back to the caller.
+    private int pinDiscovery() {
+        int ret = NfcService.setFelicaSessionActiveAndWait(true, ROUTING_TIMEOUT_MS);
+        if (ret != ERROR_NONE) {
+            Log.w(TAG, "pinning discovery failed error=" + ret);
+        }
+        return ret;
+    }
+
+    private void unpinDiscoveryIfIdle() {
+        synchronized (this) {
+            if (!mSeSessions.isEmpty() || !mRfSessions.isEmpty()) {
+                return;
+            }
+        }
+        NfcService.setFelicaSessionActiveAndWait(false, ROUTING_TIMEOUT_MS);
+    }
+
+    private synchronized Session getSeSession(int handle) {
+        return mSeSessions.get(handle);
     }
 
     @Override
@@ -86,35 +159,39 @@ public final class FelicaBackendService extends IFelica.Stub {
             }
         }
 
-        if (!NfcService.requestFelicaRoutingAndWait(ROUTING_TIMEOUT_MS)) {
-            Log.w(TAG, "openSe routing failed");
-            return openError(ERROR_FAILED);
+        int ret = pinDiscovery();
+        if (ret != ERROR_NONE) {
+            unpinDiscoveryIfIdle();
+            return openError(ret);
         }
 
-        int handle = mNativeSe.open();
-        if (handle < 0) {
-            Log.w(TAG, "NativeFelicaSe.open failed error=" + handle);
-            return openError(handle);
+        Session session;
+        synchronized (this) {
+            if (!mSeSessions.isEmpty()) {
+                session = null;
+            } else {
+                session = new Session(mNextSeHandle++, token, true);
+                if (mNextSeHandle <= 0) {
+                    mNextSeHandle = 1;
+                }
+                mSeSessions.put(session.handle, session);
+            }
+        }
+        if (session == null) {
+            return openError(ERROR_BUSY);
         }
 
-        Session session = new Session(handle, token, true);
         try {
             token.linkToDeath(session, 0);
         } catch (RemoteException e) {
-            mNativeSe.close(handle);
+            synchronized (this) {
+                mSeSessions.remove(session.handle);
+            }
+            unpinDiscoveryIfIdle();
             return openError(ERROR_FAILED);
         }
 
-        synchronized (this) {
-            if (!mSeSessions.isEmpty()) {
-                token.unlinkToDeath(session, 0);
-                mNativeSe.close(handle);
-                return openError(ERROR_BUSY);
-            }
-            mSeSessions.put(handle, session);
-        }
-
-        return openSuccess(handle);
+        return openSuccess(session.handle);
     }
 
     @Override
@@ -130,23 +207,39 @@ public final class FelicaBackendService extends IFelica.Stub {
         }
 
         session.token.unlinkToDeath(session, 0);
-        return mNativeSe.close(handle);
+        // The stock service refuses to close a connected session.  Mobile
+        // FeliCa always disconnects first anyway; doing it here keeps a
+        // client that does not from leaving the wired connection behind.
+        disconnectNative(session);
+        unpinDiscoveryIfIdle();
+        return ERROR_NONE;
     }
 
     @Override
     public Bundle transceiveSe(String packageName, int handle, byte[] data, int timeoutMs) {
-        if (data == null || data.length == 0) {
+        if (data == null || data.length == 0 || timeoutMs < 0) {
             return transceiveError(ERROR_INVALID_PARAM);
         }
 
-        synchronized (this) {
-            if (!mSeSessions.containsKey(handle)) {
-                return transceiveError(ERROR_INVALID_PARAM);
-            }
+        Session session = getSeSession(handle);
+        if (session == null) {
+            return transceiveError(ERROR_INVALID_PARAM);
+        }
+        int deviceHandle = session.deviceHandle;
+        if (deviceHandle == NO_DEVICE_HANDLE) {
+            // Same answer as the stock service for a session that was opened
+            // but not connected.
+            return transceiveError(ERROR_INVALID_STATUS);
         }
 
         int[] error = new int[] {ERROR_FAILED};
-        byte[] response = mNativeSe.transceive(handle, data, timeoutMs, error);
+        byte[] response;
+        acquireWakeLock();
+        try {
+            response = mNativeSe.transceive(deviceHandle, data, timeoutMs, error);
+        } finally {
+            releaseWakeLock();
+        }
 
         Bundle b = new Bundle();
         b.putByteArray("out", response);
@@ -156,27 +249,80 @@ public final class FelicaBackendService extends IFelica.Stub {
 
     @Override
     public int cancelSe(String packageName, int handle) {
-        synchronized (this) {
-            if (!mSeSessions.containsKey(handle)) {
-                return ERROR_INVALID_PARAM;
-            }
+        Session session = getSeSession(handle);
+        if (session == null) {
+            return ERROR_INVALID_PARAM;
+        }
+        int deviceHandle = session.deviceHandle;
+        if (deviceHandle == NO_DEVICE_HANDLE) {
+            return ERROR_INVALID_STATUS;
         }
 
-        mNativeSe.cancel(handle);
+        mNativeSe.cancel(deviceHandle);
         return ERROR_NONE;
     }
 
     @Override
     public int connectSe(String packageName, int handle) {
-        synchronized (this) {
-            return mSeSessions.containsKey(handle) ? ERROR_NONE : ERROR_INVALID_PARAM;
+        Session session = getSeSession(handle);
+        if (session == null) {
+            return ERROR_INVALID_PARAM;
+        }
+
+        synchronized (mNativeLock) {
+            if (session.deviceHandle != NO_DEVICE_HANDLE) {
+                return ERROR_NONE;
+            }
+
+            int deviceHandle;
+            acquireWakeLock();
+            try {
+                deviceHandle = mNativeSe.open();
+            } finally {
+                releaseWakeLock();
+            }
+            if (deviceHandle < 0) {
+                Log.w(TAG, "connectSe: NativeFelicaSe.open failed error=" + deviceHandle);
+                return deviceHandle;
+            }
+
+            if (getSeSession(handle) != session) {
+                // Closed (or its client died) while we were connecting.
+                mNativeSe.close(deviceHandle);
+                return ERROR_INVALID_PARAM;
+            }
+            session.deviceHandle = deviceHandle;
+            Log.i(TAG, "connectSe handle=" + handle + " device=" + deviceHandle);
+            return ERROR_NONE;
         }
     }
 
     @Override
     public int disconnectSe(String packageName, int handle) {
-        synchronized (this) {
-            return mSeSessions.containsKey(handle) ? ERROR_NONE : ERROR_INVALID_PARAM;
+        Session session = getSeSession(handle);
+        if (session == null) {
+            return ERROR_INVALID_PARAM;
+        }
+        return disconnectNative(session);
+    }
+
+    private int disconnectNative(Session session) {
+        synchronized (mNativeLock) {
+            int deviceHandle = session.deviceHandle;
+            if (deviceHandle == NO_DEVICE_HANDLE) {
+                return ERROR_NONE;
+            }
+            session.deviceHandle = NO_DEVICE_HANDLE;
+
+            int ret;
+            acquireWakeLock();
+            try {
+                ret = mNativeSe.close(deviceHandle);
+            } finally {
+                releaseWakeLock();
+            }
+            Log.i(TAG, "disconnectSe handle=" + session.handle + " result=" + ret);
+            return ret;
         }
     }
 
@@ -197,22 +343,43 @@ public final class FelicaBackendService extends IFelica.Stub {
                 }
                 return openError(ERROR_BUSY);
             }
-
-            int handle = mNextRfHandle++;
-            if (mNextRfHandle <= 0) {
-                mNextRfHandle = 1;
-            }
-
-            Session session = new Session(handle, token, false);
-            try {
-                token.linkToDeath(session, 0);
-            } catch (RemoteException e) {
-                return openError(ERROR_FAILED);
-            }
-
-            mRfSessions.put(handle, session);
-            return openSuccess(handle);
         }
+
+        // The stock service pins discovery for an RF session too
+        // (FELICA_STATE_RF in VNfcService.applyRoutingForFn).
+        int ret = pinDiscovery();
+        if (ret != ERROR_NONE) {
+            unpinDiscoveryIfIdle();
+            return openError(ret);
+        }
+
+        Session session;
+        synchronized (this) {
+            if (!mRfSessions.isEmpty()) {
+                session = null;
+            } else {
+                session = new Session(mNextRfHandle++, token, false);
+                if (mNextRfHandle <= 0) {
+                    mNextRfHandle = 1;
+                }
+                mRfSessions.put(session.handle, session);
+            }
+        }
+        if (session == null) {
+            return openError(ERROR_BUSY);
+        }
+
+        try {
+            token.linkToDeath(session, 0);
+        } catch (RemoteException e) {
+            synchronized (this) {
+                mRfSessions.remove(session.handle);
+            }
+            unpinDiscoveryIfIdle();
+            return openError(ERROR_FAILED);
+        }
+
+        return openSuccess(session.handle);
     }
 
     @Override
@@ -228,12 +395,23 @@ public final class FelicaBackendService extends IFelica.Stub {
         }
 
         session.token.unlinkToDeath(session, 0);
+        unpinDiscoveryIfIdle();
         return ERROR_NONE;
     }
 
+    // There is no reader/writer path to an external card yet.  Answer the way
+    // the stock service does when nothing answers the polling: connect times
+    // out (-13, "no card"), and transceive on a session that never got
+    // connected is an invalid state (-11).  Not -18: Mobile FeliCa reads that
+    // as "FeliCa is locked".
     @Override
     public Bundle transceiveRf(String packageName, int handle, byte[] data, int timeoutMs) {
-        return transceiveError(ERROR_NOT_AVAILABLE);
+        synchronized (this) {
+            if (!mRfSessions.containsKey(handle)) {
+                return transceiveError(ERROR_INVALID_PARAM);
+            }
+        }
+        return transceiveError(ERROR_INVALID_STATUS);
     }
 
     @Override
@@ -246,7 +424,7 @@ public final class FelicaBackendService extends IFelica.Stub {
     @Override
     public int connectRf(String packageName, int handle, int timeoutMs) {
         synchronized (this) {
-            return mRfSessions.containsKey(handle) ? ERROR_NONE : ERROR_INVALID_PARAM;
+            return mRfSessions.containsKey(handle) ? ERROR_TIMEOUT : ERROR_INVALID_PARAM;
         }
     }
 
@@ -299,24 +477,26 @@ public final class FelicaBackendService extends IFelica.Stub {
             return false;
         }
 
-        int handle = mNativeSe.open();
-        if (handle < 0) {
-            Log.w(TAG, "warmupSe open failed error=" + handle);
-            return false;
+        synchronized (mNativeLock) {
+            int handle = mNativeSe.open();
+            if (handle < 0) {
+                Log.w(TAG, "warmupSe open failed error=" + handle);
+                return false;
+            }
+
+            int[] error = new int[] {ERROR_FAILED};
+            byte[] response = mNativeSe.transceive(
+                    handle, WARMUP_POLLING_COMMAND, WARMUP_TRANSCEIVE_TIMEOUT_MS, error);
+
+            int closeResult = mNativeSe.close(handle);
+
+            Log.i(TAG, "warmupSe completed handle=" + handle
+                    + " responseLen=" + (response != null ? response.length : -1)
+                    + " error=" + error[0]
+                    + " closeResult=" + closeResult);
+
+            return error[0] == ERROR_NONE;
         }
-
-        int[] error = new int[] {ERROR_FAILED};
-        byte[] response = mNativeSe.transceive(
-                handle, WARMUP_POLLING_COMMAND, WARMUP_TRANSCEIVE_TIMEOUT_MS, error);
-
-        int closeResult = mNativeSe.close(handle);
-
-        Log.i(TAG, "warmupSe completed handle=" + handle
-                + " responseLen=" + (response != null ? response.length : -1)
-                + " error=" + error[0]
-                + " closeResult=" + closeResult);
-
-        return error[0] == ERROR_NONE;
     }
 
     private static Bundle openSuccess(int handle) {
@@ -344,6 +524,9 @@ public final class FelicaBackendService extends IFelica.Stub {
         final int handle;
         final IBinder token;
         final boolean se;
+        // Native NFCEE handle while connected (SE only).  Guarded by mNativeLock
+        // for writes; read without it by transceive/cancel.
+        volatile int deviceHandle = NO_DEVICE_HANDLE;
 
         Session(int handle, IBinder token, boolean se) {
             this.handle = handle;
@@ -358,15 +541,17 @@ public final class FelicaBackendService extends IFelica.Stub {
                     mSeSessions.remove(handle);
                 } else {
                     mRfSessions.remove(handle);
-                    return;
                 }
             }
 
-            try {
-                mNativeSe.close(handle);
-            } catch (RuntimeException e) {
-                Log.w(TAG, "close after binderDied failed", e);
+            if (se) {
+                try {
+                    disconnectNative(this);
+                } catch (RuntimeException e) {
+                    Log.w(TAG, "disconnect after binderDied failed", e);
+                }
             }
+            unpinDiscoveryIfIdle();
         }
     }
 }
