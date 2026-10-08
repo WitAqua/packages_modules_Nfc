@@ -65,6 +65,9 @@ const JNINativeMethod RoutingManager::sMethods[] = {
     {"doGetEuiccMepMode", "()I",
      (void*)RoutingManager::com_android_nfc_cardemulation_doGetEuiccMepMode}};
 
+// How long to wait for the NFCC to re-issue its discovery request
+// after an element has been activated.
+static const long EE_DISCOVER_REQ_TIMEOUT_MS = 1000;
 // SCBR from host works only when App is in foreground
 static const uint8_t SYS_CODE_PWR_STATE_HOST = 0x01;
 static const uint16_t DEFAULT_SYS_CODE = 0xFEFE;
@@ -227,6 +230,7 @@ bool RoutingManager::initialize(nfc_jni_native_data* native) {
       mEeInfoEvent.wait();
     }
   }
+  activateFelicaEe();
 
   // Set the host-routing Tech
   tNFA_STATUS nfaStat = NFA_CeSetIsoDepListenTech(
@@ -1083,6 +1087,96 @@ bool RoutingManager::checkUiccListenConfigNeeded(
     config = true;
   }
   return config;
+}
+
+/*******************************************************************************
+**
+** Function:        activateFelicaEe
+**
+** Description:     Bring up the element DEFAULT_NFCF_ROUTE points at, so that
+**                  the routing table can be built with Type-F on it.
+**
+**                  The NFCC leaves an inactive element out of
+**                  RF_NFCEE_DISCOVERY_REQ_NTF entirely - on joan_jp the request
+**                  lists the UICC alone and says nothing about Type-F, so
+**                  updateEeTechRouteSetting() finds no FeliCa route and falls
+**                  the technology back to the host. One NFCEE_MODE_SET is
+**                  enough to make the NFCC re-issue the request with the
+**                  element and its lf_protocol in it.
+**
+**                  Stock does this from its own routing manager at startup;
+**                  AOSP only ever deactivates, in onNfccShutdown().
+**
+** Returns:         None.
+**
+*******************************************************************************/
+void RoutingManager::activateFelicaEe() {
+  static const char fn[] = "RoutingManager::activateFelicaEe";
+
+  if (mDefaultFelicaRoute == 0) return;
+
+  tNFA_HANDLE eeHandle = mDefaultFelicaRoute | NFA_HANDLE_GROUP_EE;
+  uint8_t actualNumEe = NFA_EE_MAX_EE_SUPPORTED;
+  tNFA_EE_INFO eeInfo[actualNumEe];
+
+  memset(&eeInfo, 0, sizeof(eeInfo));
+  tNFA_STATUS nfaStat = NFA_EeGetInfo(&actualNumEe, eeInfo);
+  if (nfaStat != NFA_STATUS_OK) {
+    LOG(ERROR) << StringPrintf("%s: fail get info; error=0x%X", fn, nfaStat);
+    return;
+  }
+
+  for (uint8_t xx = 0; xx < actualNumEe; xx++) {
+    if (eeInfo[xx].ee_handle != eeHandle) continue;
+
+    /* Only a native FeliCa element, one that speaks T3T over the NFCEE
+     * interface, is left inactive like this. An eSE that DEFAULT_NFCF_ROUTE
+     * points at on NXP parts is brought up by its own HAL, so leave it be. */
+    bool isT3t = false;
+    for (uint8_t i = 0; i < eeInfo[xx].num_interface; i++) {
+      if (eeInfo[xx].ee_interface[i] == NCI_NFCEE_INTERFACE_T3T) isT3t = true;
+    }
+    if (!isT3t) {
+      LOG(DEBUG) << StringPrintf("%s: handle 0x%04x has no T3T interface", fn,
+                                 eeHandle);
+      return;
+    }
+
+    if (eeInfo[xx].ee_status == NFA_EE_STATUS_ACTIVE) {
+      LOG(DEBUG) << StringPrintf("%s: handle 0x%04x is already active", fn,
+                                 eeHandle);
+      return;
+    }
+
+    {
+      SyncEventGuard guard(mEeSetModeEvent);
+      nfaStat = NFA_EeModeSet(eeHandle, NFA_EE_MD_ACTIVATE);
+      if (nfaStat != NFA_STATUS_OK) {
+        LOG(ERROR) << StringPrintf("%s: fail mode set; error=0x%X", fn,
+                                   nfaStat);
+        return;
+      }
+      mEeSetModeEvent.wait();  // wait for NFA_EE_MODE_SET_EVT
+    }
+
+    /* The request that carries the element arrives on its own once the mode
+     * set is answered. Give it a moment rather than routing on the old one;
+     * a timeout is not fatal, since the next commitRouting() rebuilds the
+     * table from whatever arrived in the meantime. */
+    {
+      SyncEventGuard guard(mEeInfoEvent);
+      if (!mEeInfoEvent.wait(EE_DISCOVER_REQ_TIMEOUT_MS)) {
+        LOG(WARNING) << StringPrintf(
+            "%s: no discovery request after activating 0x%04x", fn, eeHandle);
+      }
+    }
+
+    LOG(DEBUG) << StringPrintf("%s: activated handle 0x%04x", fn, eeHandle);
+    return;
+  }
+
+  LOG(WARNING) << StringPrintf("%s: no element with handle 0x%04x", fn,
+                               eeHandle);
 }
 
 /*******************************************************************************
