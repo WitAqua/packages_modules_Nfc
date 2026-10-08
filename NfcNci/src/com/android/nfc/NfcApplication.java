@@ -68,7 +68,7 @@ public class NfcApplication extends Application {
             mNfcService = new NfcService(this, new NfcInjector(this, Looper.myLooper()));
 
             // 2by2 Additions for felica
-            FelicaBackendService.register();
+            FelicaBackendService.register(this);
         }
     }
 }

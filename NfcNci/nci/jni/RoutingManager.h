@@ -84,6 +84,7 @@ class RoutingManager {
   void notifyActivated(uint8_t technology);
   void notifyDeactivated(uint8_t technology);
   void notifyEeUpdated();
+  void activateFelicaEe();
   tNFA_TECHNOLOGY_MASK updateEeTechRouteSetting();
   void updateDefaultProtocolRoute();
   void updateDefaultRoute();
